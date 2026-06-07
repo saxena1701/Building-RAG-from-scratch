@@ -1,3 +1,6 @@
 anthropic
 pypdf
 python-dotenv
+psycopg2-binary
+pgvector
+sentence-transformers
