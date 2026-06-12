@@ -5,7 +5,6 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from pypdf import PdfReader
 
 
 
@@ -63,56 +62,19 @@ def parse_markdown(file_path: Path, manifest_entry: dict) -> list[Document]:
 # PDF parser
 # ---------------------------------------------------------------------------
 
-def _extract_pdf_headings(text: str) -> list[str]:
-    """
-    Heuristic: lines that are short, title-cased or ALL-CAPS, and not
-    ending with punctuation are likely headings in a product manual.
-    """
-    headings = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped or len(stripped) > 80:
-            continue
-        if stripped[-1] in ".,:;?!":
-            continue
-        if stripped.isupper() or stripped.istitle():
-            headings.append(stripped)
-    return headings
-
-
 def parse_pdf(file_path: Path, manifest_entry: dict) -> list[Document]:
-    """
-    Parse a PDF into one Document per page.
+    from unstructured.partition.pdf import partition_pdf
+    from unstructured.documents.elements import NarrativeText, Title, ListItem
 
-    Metadata contains all manifest fields plus:
-      - page: 1-based page number
-      - total_pages: total page count
-      - headings: heuristic headings detected on that page
-    """
-    reader = PdfReader(str(file_path))
-    total_pages = len(reader.pages)
-    documents: list[Document] = []
+    elements = partition_pdf(filename=str(file_path), strategy="fast")
 
-    for page_num, page in enumerate(reader.pages, start=1):
-        text = page.extract_text() or ""
-        headings = _extract_pdf_headings(text)
+    headings = [e.text for e in elements if isinstance(e, Title)]
+    body_elements = [e for e in elements if isinstance(e, (NarrativeText, Title, ListItem))]
+    text = "\n\n".join(e.text for e in body_elements if e.text.strip())
 
-        metadata = {
-            **manifest_entry,
-            "page": page_num,
-            "total_pages": total_pages,
-            "headings": headings,
-        }
+    metadata = {**manifest_entry, "headings": headings}
 
-        documents.append(
-            Document(
-                source_id=manifest_entry["document_id"],
-                text=text.strip(),
-                metadata=metadata,
-            )
-        )
-
-    return documents
+    return [Document(source_id=manifest_entry["document_id"], text=text, metadata=metadata)]
 
 
 # ---------------------------------------------------------------------------

@@ -73,13 +73,13 @@ def chunk_document(
 
         # Verify and trim/grow to fit within max_tokens.
         candidate = " ".join(words[start_word:end_word])
-        actual_tokens = count_tokens(candidate, client)
+        actual_tokens = int(len(candidate) / chars_per_token)
 
         # Trim if over budget.
         while actual_tokens > max_tokens and end_word > start_word + 1:
             end_word -= 1
             candidate = " ".join(words[start_word:end_word])
-            actual_tokens = count_tokens(candidate, client)
+            actual_tokens = int(len(candidate) / chars_per_token)
 
         chunks.append((start_word, end_word, candidate, actual_tokens))
 

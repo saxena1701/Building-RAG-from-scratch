@@ -12,6 +12,7 @@ dependencies = [
     "python-dotenv",
     "psycopg2-binary",
     "sentence-transformers",
+    "unstructured[pdf]"
 ]
 
 [tool.setuptools.packages.find]

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
+from pathlib import Path
+from dotenv import load_dotenv
 
 import psycopg2
 from sentence_transformers import SentenceTransformer
@@ -97,3 +101,17 @@ def retrieve(query: str, db_url: str, top_k: int = 5) -> dict:
             for row in rows
         ]
     }
+
+
+if __name__ == "__main__":
+    load_dotenv()
+    db_url = os.getenv("DATABASE_URL")
+
+    from .chunker import load_chunks
+
+    in_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("data/chunks/chunks_v1.jsonl")
+    chunks = load_chunks(in_path)
+    embed_and_index(chunks, db_url=db_url)
+    print(f"\nDone. Indexed {len(chunks)} chunks.")
+
+
