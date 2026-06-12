@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import os
 import json
-import psycopg2
-from dotenv import load_dotenv
-from sentence_transformers import SentenceTransformer
-from chunker import Chunk
 
-load_dotenv()
+import psycopg2
+from sentence_transformers import SentenceTransformer
+
+from .chunker import Chunk
 
 _MODEL_NAME = "all-MiniLM-L6-v2"
 _BATCH_SIZE = 100
@@ -22,13 +20,17 @@ def _get_model() -> SentenceTransformer:
     return _model
 
 
-def _get_conn() -> psycopg2.extensions.connection:
-    return psycopg2.connect(os.getenv("DATABASE_URL"))
+def _get_conn(db_url: str) -> psycopg2.extensions.connection:
+    return psycopg2.connect(db_url)
 
 
-def embed_and_index(chunks: list[Chunk], batch_size: int = _BATCH_SIZE) -> None:
+def embed_and_index(
+    chunks: list[Chunk],
+    db_url: str,
+    batch_size: int = _BATCH_SIZE,
+) -> None:
     model = _get_model()
-    conn = _get_conn()
+    conn = _get_conn(db_url)
 
     try:
         with conn:
@@ -65,14 +67,33 @@ def embed_and_index(chunks: list[Chunk], batch_size: int = _BATCH_SIZE) -> None:
         conn.close()
 
 
-if __name__ == "__main__":
-    import sys
-    from pathlib import Path
+def retrieve(query: str, db_url: str, top_k: int = 5) -> dict:
+    model = _get_model()
+    query_embedding = model.encode(query).tolist()
 
-    sys.path.insert(0, str(Path(__file__).parent))
-    from chunker import load_chunks
+    conn = _get_conn(db_url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT chunk_id, source_document_id, text
+                FROM chunks
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+                """,
+                (query_embedding, top_k),
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
 
-    in_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("data/chunks/chunks_v1.jsonl")
-    chunks = load_chunks(in_path)
-    embed_and_index(chunks)
-    print(f"\nDone. Indexed {len(chunks)} chunks.")
+    return {
+        "results": [
+            {
+                "chunk_id": row[0],
+                "source": row[1],
+                "text": row[2],
+            }
+            for row in rows
+        ]
+    }

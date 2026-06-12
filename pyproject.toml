@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rag-core"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic",
+    "pypdf",
+    "python-dotenv",
+    "psycopg2-binary",
+    "sentence-transformers",
+]
+
+[tool.setuptools.packages.find]
+include = ["rag_core*"]

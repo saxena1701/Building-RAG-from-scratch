@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from parser import Document, load_documents
+from .parser import Document, load_documents
 
 _MODEL = "claude-haiku-4-5-20251001"
 
