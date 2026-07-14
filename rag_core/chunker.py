@@ -83,6 +83,9 @@ def chunk_document(
 
         chunks.append((start_word, end_word, candidate, actual_tokens))
 
+        if end_word >= len(words):
+            break
+
         # Advance start, leaving overlap_chars worth of words behind.
         advance_chars = 0
         advance_words = 0
