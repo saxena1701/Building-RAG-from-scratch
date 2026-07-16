@@ -7,7 +7,7 @@ A production-ready Retrieval-Augmented Generation (RAG) system built from first 
 RAG enhances language models by retrieving relevant information from a knowledge base before generating responses. This system implements a typical RAG pipeline:
 
 ```
-Documents → Parser → Chunker → Embedder → Vector DB → Retrieval
+Documents → Parser → Chunker → Embedder → Vector DB → Retrieval (dense / lexical / hybrid) → Evaluation
 ```
 
 ## Architecture
@@ -180,6 +180,9 @@ The chunker uses **token-aware chunking** to respect API limits:
 - Ensures chunks fit within embedding API token limits (~512 tokens for typical models)
 - Overlap prevents losing context at chunk boundaries
 
+**Boundary Fix:**
+The windowing loop now stops as soon as a window reaches the end of the document (`end_word >= len(words)`). Previously the overlap logic could advance past the final word and emit a redundant trailing chunk that duplicated content already covered. Removing this shrank the regenerated `chunks_v1.jsonl` substantially with no loss of coverage.
+
 #### Configuration
 
 ```python
@@ -312,6 +315,159 @@ The `<=>` operator computes cosine distance (PostgreSQL pgvector operator).
 
 ---
 
+### Phase 7: Lexical Retrieval (BM25)
+
+**File:** `rag_core/lexical_retriever.py`
+
+Dense retrieval captures meaning but can miss exact terms—product codes, acronyms, rare keywords. Lexical retrieval complements it with classic BM25 keyword scoring, powered by [ParadeDB](https://www.paradedb.com/)'s `pg_search` extension (a Tantivy-backed full-text index living inside Postgres).
+
+#### Index Setup
+
+`ensure_bm25_index` idempotently installs the extension and builds the BM25 index. A fresh clone runs it once after embedding:
+
+```bash
+python -m rag_core.lexical_retriever
+```
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_search;
+
+CREATE INDEX IF NOT EXISTS chunks_bm25_idx
+ON chunks USING bm25 (chunk_id, text)
+WITH (key_field = 'chunk_id');
+```
+
+#### Retrieval Process
+
+```python
+from rag_core import lexical_retrieve
+
+results = lexical_retrieve(
+    query="How does the system handle errors?",
+    db_url="postgresql://...",
+    top_k=5,
+)
+```
+
+Queries run through the `paradedb.match()` builder rather than the raw `text @@@ %s` string form:
+
+```sql
+SELECT chunk_id, source_document_id, text, paradedb.score(chunk_id) AS score
+FROM chunks
+WHERE chunk_id @@@ paradedb.match('text', %s)
+ORDER BY paradedb.score(chunk_id) DESC
+LIMIT 5
+```
+
+**Why the query builder?**
+- Arbitrary natural-language queries (punctuation, quotes, boolean words) are treated as plain OR'd terms and cannot break Tantivy query parsing
+- A query with no indexed-term overlap simply returns `{"results": []}`, letting hybrid fusion degrade gracefully to dense-only
+
+The result shape matches the dense retriever exactly (`{"results": [{chunk_id, source, text, score}, ...]}`, list order == rank), so it is a drop-in for both the eval harness and the interactive query script.
+
+---
+
+### Phase 8: Hybrid Retrieval (Reciprocal Rank Fusion)
+
+**File:** `rag_core/hybrid_retriever.py`
+
+Hybrid retrieval fuses the dense and lexical rankings so a chunk surfaced by *either* method can be returned, and one surfaced by *both* is boosted. Fusion uses **Reciprocal Rank Fusion (RRF)**, which combines lists by rank alone—no need to reconcile incompatible cosine-distance and BM25 score scales.
+
+#### RRF Scoring
+
+Each list contributes to a chunk's score based on its rank `r` (1-indexed):
+
+```
+score(chunk) = Σ  weight_list / (rrf_k + r)
+```
+
+- `rrf_k` (default **60**) dampens the influence of the very top ranks
+- `weights` (one per list) let a stronger retriever count more
+
+#### Retrieval Process
+
+```python
+from rag_core import hybrid_retrieve
+
+results = hybrid_retrieve(
+    query="How does the system handle errors?",
+    db_url="postgresql://...",
+    top_k=5,
+    candidate_k=20,      # wider pool pulled from each branch before fusion
+    dense_weight=1.0,
+    lexical_weight=1.0,
+)
+```
+
+1. Query each branch for a wider `candidate_k` pool (default 20)
+2. Fuse by `chunk_id` with RRF, summing weighted contributions
+3. Sort by fused score and truncate to `top_k`
+
+`source`/`text` are reused from whichever branch surfaced the chunk, so fusion needs no extra DB round-trip. Each result also carries a `retrievers` field recording which branches found it:
+
+```python
+{
+  "chunk_id": "doc_001_c2",
+  "source": "doc_001",
+  "text": "Error handling involves try-catch blocks...",
+  "score": 0.032,
+  "retrievers": ["dense", "lexical"]   # provenance
+}
+```
+
+**Tuning Note:**
+On this corpus dense retrieval is markedly stronger than BM25, so equal `1.0/1.0` weights let the weaker lexical list dilute an otherwise-good dense ranking. Up-weighting dense (and/or lowering `candidate_k`) narrows the gap. Defaults are plain RRF, so behavior is unchanged unless tuned.
+
+---
+
+### Phase 9: Evaluation Harness
+
+**Files:** `rag_core/eval.py`, `eval_retrieval.py`
+**Dataset:** `data/eval/retrieval_eval_v1.jsonl`
+
+To compare retrievers objectively (A/B testing dense vs. lexical vs. hybrid), the harness scores each against a labeled eval set using standard retrieval metrics.
+
+#### Metrics
+
+- **Recall@k** — fraction of expected chunks retrieved in the top-k
+- **MRR@k** (Mean Reciprocal Rank) — `1 / rank` of the first relevant chunk, rewarding ranking the right answer higher
+
+Both are reported overall and broken down by query **category**:
+- `single_chunk` — answer stated directly in one chunk
+- `multi_chunk_synthesis` — answer requires combining several chunks
+- `vocab_mismatch` — query wording differs from the source (stresses semantic vs. lexical matching)
+
+Queries with no expected answer (`no_answer`) are logged with their retrieved chunks for manual review but excluded from recall/MRR (no score threshold is available to judge them).
+
+#### Eval Set Format (`retrieval_eval_v1.jsonl`)
+
+```json
+{
+  "query_id": "q01",
+  "category": "single_chunk",
+  "query": "What's the standard return window for most items?",
+  "expected_chunk_ids": ["return_policy_c0"],
+  "also_relevant_chunk_ids": ["faq_return_window_c0"],
+  "notes": "Baseline. Answer (30 days) stated directly in the return policy."
+}
+```
+
+#### Running an A/B Evaluation
+
+```bash
+# Evaluate any retriever; writes a timestamped JSON report to data/eval/results/
+python eval_retrieval.py --retriever dense
+python eval_retrieval.py --retriever lexical
+python eval_retrieval.py --retriever hybrid
+
+# Optional positional args: eval file path and k (defaults: retrieval_eval_v1.jsonl, 5)
+python eval_retrieval.py data/eval/retrieval_eval_v1.jsonl 5 --retriever hybrid
+```
+
+The harness prints a per-query and per-category summary, then saves the full report (`recall_at_k`, `mrr_at_k`, per-category stats, and unscored `no_answer` rows) for later comparison.
+
+---
+
 ## Usage
 
 ### 1. Parse Documents
@@ -332,12 +488,30 @@ python -m rag_core.chunker data/parsed/documents.jsonl data/chunks/chunks_v1.jso
 python -m rag_core.embedder_retriever data/chunks/chunks_v1.jsonl
 ```
 
-### 4. Query the System
+### 4. (Optional) Build the BM25 Lexical Index
+
+Required only for `lexical` and `hybrid` retrieval:
 
 ```bash
-python rag_retrieval.py
+python -m rag_core.lexical_retriever
+```
+
+### 5. Query the System
+
+```bash
+python rag_retrieval.py                      # dense (default)
+python rag_retrieval.py --retriever lexical  # BM25 keyword search
+python rag_retrieval.py --retriever hybrid   # RRF fusion of both
 # Enter your query: What is machine learning?
 # Returns top 5 most relevant chunks
+```
+
+### 6. Evaluate / Compare Retrievers
+
+```bash
+python eval_retrieval.py --retriever dense
+python eval_retrieval.py --retriever hybrid
+# Prints recall@k / MRR@k per category and saves a JSON report
 ```
 
 ---
@@ -371,15 +545,17 @@ DATABASE_URL=...     # PostgreSQL + pgvector connection
 | Sentence-Transformers | 384-dim vs. GPT-3 embeddings (1536-dim) | Sufficient for semantic search; 4x smaller, faster, self-hosted |
 | PostgreSQL + pgvector | No specialized vector DB | Simpler ops; pgvector HNSW competitive with specialized DBs |
 | Batch embedding | Higher latency per batch | 10-50x faster than single encoding; amortizes model load time |
+| RRF for hybrid fusion | Ignores raw score magnitudes | Rank-based; avoids reconciling incompatible cosine-distance and BM25 scales |
+| Eval-driven A/B testing | Upfront cost of a labeled set | Retriever changes are measured (recall@k / MRR@k), not guessed |
 
 ---
 
 ## Next Steps
 
 - **Reranking:** Use cross-encoders to rerank top-K results before LLM
-- **Hybrid Search:** Combine vector search with BM25 full-text search
 - **Metadata Filtering:** Pre-filter chunks by document type or date before similarity search
 - **Query Expansion:** Expand queries with synonyms or reformulations for better coverage
+- **Generation:** Feed retrieved chunks to an LLM to produce grounded answers (completing the "G" in RAG)
 
 ---
 
