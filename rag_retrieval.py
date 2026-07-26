@@ -3,12 +3,19 @@ import os
 
 from dotenv import load_dotenv
 
-from rag_core import hybrid_retrieve, lexical_retrieve, retrieve
+from rag_core import (
+    hybrid_retrieve,
+    lexical_retrieve,
+    make_reranking_retriever,
+    retrieve,
+)
 
 RETRIEVERS = {
     "dense": retrieve,
     "lexical": lexical_retrieve,
     "hybrid": hybrid_retrieve,
+    "rerank-dense": make_reranking_retriever(retrieve),
+    "rerank-hybrid": make_reranking_retriever(hybrid_retrieve),
 }
 
 load_dotenv()

@@ -7,7 +7,7 @@ A production-ready Retrieval-Augmented Generation (RAG) system built from first 
 RAG enhances language models by retrieving relevant information from a knowledge base before generating responses. This system implements a typical RAG pipeline:
 
 ```
-Documents → Parser → Chunker → Embedder → Vector DB → Retrieval (dense / lexical / hybrid) → Evaluation
+Documents → Parser → Chunker → Embedder → Vector DB → Retrieval (dense / lexical / hybrid) → Reranking (cross-encoder) → Evaluation
 ```
 
 ## Architecture
@@ -420,12 +420,58 @@ On this corpus dense retrieval is markedly stronger than BM25, so equal `1.0/1.0
 
 ---
 
-### Phase 9: Evaluation Harness
+### Phase 9: Reranking (Cross-Encoder)
+
+**File:** `rag_core/reranker_retriever.py`
+
+The base retrievers rank on a *single* signal — bi-encoder cosine distance, BM25, or their RRF combination. Each embeds the query and a chunk *independently*, so subtle relevance cues are lost. A **cross-encoder** reranker fixes this by scoring each `(query, chunk_text)` pair *jointly* in one forward pass, which is far more accurate — but too slow to run over the whole corpus. So it's applied as a second stage: pull a wide candidate pool, rerank it, keep the best few.
+
+#### Retrieve-then-Rerank Flow
+
+```
+query → base retriever (top 20) → cross-encoder rescoring → top 5
+```
+
+1. Retrieve `candidate_k` (default **20**) results from any base retriever
+2. Score every `(query, chunk_text)` pair with the cross-encoder (`cross-encoder/ms-marco-MiniLM-L-6-v2`, from the already-installed `sentence-transformers` — no new dependency or API key)
+3. Sort by rerank score and return the top `top_k` (default **5**)
+
+The base retriever is chosen at wiring time (no default). A small factory binds it into the standard `(query, db_url, top_k)` retriever contract, so reranked variants are drop-in for the CLI and the eval harness:
+
+```python
+from rag_core import make_reranking_retriever, hybrid_retrieve, rerank_retrieve
+
+rerank_hybrid = make_reranking_retriever(hybrid_retrieve, candidate_k=20)
+results = rerank_hybrid(query, db_url=db_url, top_k=5)
+
+# or call the underlying function directly:
+results = rerank_retrieve(query, db_url, base_retriever=hybrid_retrieve, top_k=5, candidate_k=20)
+```
+
+Each result replaces the base `score` with the cross-encoder score and adds `base_rank` (its 1-indexed position in the pre-rerank pool, showing how far the reranker moved it):
+
+```python
+{
+  "chunk_id": "doc_001_c2",
+  "source": "doc_001",
+  "text": "Error handling involves try-catch blocks...",
+  "score": 7.42,       # cross-encoder relevance (raw logit; not comparable to BM25/RRF scales)
+  "base_rank": 6       # was 6th out of 20 before reranking
+}
+```
+
+Two variants are registered out of the box: `rerank-dense` and `rerank-hybrid`. If the base retriever returns nothing, the reranker returns `{"results": []}` without loading the model.
+
+**Note:** cross-encoder scores are raw logits (can be negative) and are meaningful only *relative to each other within a query* — don't threshold or compare them across queries.
+
+---
+
+### Phase 10: Evaluation Harness
 
 **Files:** `rag_core/eval.py`, `eval_retrieval.py`
 **Dataset:** `data/eval/retrieval_eval_v1.jsonl`
 
-To compare retrievers objectively (A/B testing dense vs. lexical vs. hybrid), the harness scores each against a labeled eval set using standard retrieval metrics.
+To compare retrievers objectively (A/B testing dense vs. lexical vs. hybrid vs. their reranked variants), the harness scores each against a labeled eval set using standard retrieval metrics.
 
 #### Metrics
 
@@ -459,6 +505,8 @@ Queries with no expected answer (`no_answer`) are logged with their retrieved ch
 python eval_retrieval.py --retriever dense
 python eval_retrieval.py --retriever lexical
 python eval_retrieval.py --retriever hybrid
+python eval_retrieval.py --retriever rerank-dense    # dense top-20 → cross-encoder → top-5
+python eval_retrieval.py --retriever rerank-hybrid   # hybrid top-20 → cross-encoder → top-5
 
 # Optional positional args: eval file path and k (defaults: retrieval_eval_v1.jsonl, 5)
 python eval_retrieval.py data/eval/retrieval_eval_v1.jsonl 5 --retriever hybrid
@@ -499,9 +547,10 @@ python -m rag_core.lexical_retriever
 ### 5. Query the System
 
 ```bash
-python rag_retrieval.py                      # dense (default)
-python rag_retrieval.py --retriever lexical  # BM25 keyword search
-python rag_retrieval.py --retriever hybrid   # RRF fusion of both
+python rag_retrieval.py                            # dense (default)
+python rag_retrieval.py --retriever lexical        # BM25 keyword search
+python rag_retrieval.py --retriever hybrid         # RRF fusion of both
+python rag_retrieval.py --retriever rerank-hybrid  # hybrid top-20, cross-encoder reranked to top-5
 # Enter your query: What is machine learning?
 # Returns top 5 most relevant chunks
 ```
@@ -511,6 +560,7 @@ python rag_retrieval.py --retriever hybrid   # RRF fusion of both
 ```bash
 python eval_retrieval.py --retriever dense
 python eval_retrieval.py --retriever hybrid
+python eval_retrieval.py --retriever rerank-hybrid
 # Prints recall@k / MRR@k per category and saves a JSON report
 ```
 
@@ -530,7 +580,7 @@ DATABASE_URL=...     # PostgreSQL + pgvector connection
 - **anthropic**: Token counting for accurate chunk sizing
 - **pypdf**: PDF text extraction
 - **unstructured[pdf]**: Advanced PDF parsing (layouts, tables, etc.)
-- **sentence-transformers**: Embedding model
+- **sentence-transformers**: Embedding model (bi-encoder) and cross-encoder reranker
 - **psycopg2-binary**: PostgreSQL driver
 - **python-dotenv**: Environment variable management
 
@@ -552,7 +602,6 @@ DATABASE_URL=...     # PostgreSQL + pgvector connection
 
 ## Next Steps
 
-- **Reranking:** Use cross-encoders to rerank top-K results before LLM
 - **Metadata Filtering:** Pre-filter chunks by document type or date before similarity search
 - **Query Expansion:** Expand queries with synonyms or reformulations for better coverage
 - **Generation:** Feed retrieved chunks to an LLM to produce grounded answers (completing the "G" in RAG)
