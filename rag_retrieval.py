@@ -4,8 +4,10 @@ import os
 from dotenv import load_dotenv
 
 from rag_core import (
+    fixture_rewriter,
     hybrid_retrieve,
     lexical_retrieve,
+    make_multi_query_retriever,
     make_reranking_retriever,
     retrieve,
 )
@@ -16,6 +18,7 @@ RETRIEVERS = {
     "hybrid": hybrid_retrieve,
     "rerank-dense": make_reranking_retriever(retrieve),
     "rerank-hybrid": make_reranking_retriever(hybrid_retrieve),
+    "multiquery": make_multi_query_retriever(fixture_rewriter("data/eval/rewrites_v1.jsonl")),
 }
 
 load_dotenv()
