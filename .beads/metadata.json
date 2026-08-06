@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "Building_RAG_from_scratch",
+  "project_id": "196eddf4-f8dd-48ac-927d-40977136be75"
+}
