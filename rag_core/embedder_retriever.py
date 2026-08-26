@@ -15,7 +15,8 @@ _MODEL_NAME = "all-MiniLM-L6-v2"
 _BATCH_SIZE = 100
 
 _model: SentenceTransformer | None = None
-
+os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
 def _get_model() -> SentenceTransformer:
     global _model
